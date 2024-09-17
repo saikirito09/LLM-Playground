@@ -1,59 +1,90 @@
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset
 
-class TranslationDataset(Dataset):
-    def __init__(self, data_source, source_tokenizer, target_tokenizer, source_lang, target_lang, max_length):
-        self.data = data_source
-        self.src_tokenizer = source_tokenizer
-        self.tgt_tokenizer = target_tokenizer
-        self.src_lang = source_lang
-        self.tgt_lang = target_lang
-        self.max_len = max_length
+class BilingualDataset(Dataset):
 
-        self.start_token = torch.tensor([target_tokenizer.token_to_id("[START]")], dtype=torch.int64)
-        self.end_token = torch.tensor([target_tokenizer.token_to_id("[END]")], dtype=torch.int64)
-        self.pad_token = torch.tensor([target_tokenizer.token_to_id("[PAD]")], dtype=torch.int64)
+    def __init__(self, ds, tokenizer_src, tokenizer_tgt, src_lang, tgt_lang, seq_len):
+        super().__init__()
+        self.seq_len = seq_len
+
+        self.ds = ds
+        self.tokenizer_src = tokenizer_src
+        self.tokenizer_tgt = tokenizer_tgt
+        self.src_lang = src_lang
+        self.tgt_lang = tgt_lang
+
+        self.sos_token = torch.tensor([tokenizer_tgt.token_to_id("[SOS]")], dtype=torch.int64)
+        self.eos_token = torch.tensor([tokenizer_tgt.token_to_id("[EOS]")], dtype=torch.int64)
+        self.pad_token = torch.tensor([tokenizer_tgt.token_to_id("[PAD]")], dtype=torch.int64)
 
     def __len__(self):
-        return len(self.data)
+        return len(self.ds)
 
-    def __getitem__(self, index):
-        pair = self.data[index]
-        source_text = pair['translation'][self.src_lang]
-        target_text = pair['translation'][self.tgt_lang]
+    def __getitem__(self, idx):
+        src_target_pair = self.ds[idx]
+        src_text = src_target_pair['translation'][self.src_lang]
+        tgt_text = src_target_pair['translation'][self.tgt_lang]
 
-        source_tokens = self.tokenize_and_pad(self.src_tokenizer, source_text, include_end=True)
-        target_tokens = self.tokenize_and_pad(self.tgt_tokenizer, target_text, include_end=False)
+        # Transform the text into tokens
+        enc_input_tokens = self.tokenizer_src.encode(src_text).ids
+        dec_input_tokens = self.tokenizer_tgt.encode(tgt_text).ids
 
-        target_input = torch.cat([self.start_token, target_tokens])
-        target_output = torch.cat([target_tokens, self.end_token])
+        # Add sos, eos and padding to each sentence
+        enc_num_padding_tokens = self.seq_len - len(enc_input_tokens) - 2  # We will add <s> and </s>
+        # We will only add <s>, and </s> only on the label
+        dec_num_padding_tokens = self.seq_len - len(dec_input_tokens) - 1
 
-        source_mask = self.create_padding_mask(source_tokens)
-        target_mask = self.create_causal_mask(target_input)
+        # Make sure the number of padding tokens is not negative. If it is, the sentence is too long
+        if enc_num_padding_tokens < 0 or dec_num_padding_tokens < 0:
+            raise ValueError("Sentence is too long")
+
+        # Add <s> and </s> token
+        encoder_input = torch.cat(
+            [
+                self.sos_token,
+                torch.tensor(enc_input_tokens, dtype=torch.int64),
+                self.eos_token,
+                torch.tensor([self.pad_token] * enc_num_padding_tokens, dtype=torch.int64),
+            ],
+            dim=0,
+        )
+
+        # Add only <s> token
+        decoder_input = torch.cat(
+            [
+                self.sos_token,
+                torch.tensor(dec_input_tokens, dtype=torch.int64),
+                torch.tensor([self.pad_token] * dec_num_padding_tokens, dtype=torch.int64),
+            ],
+            dim=0,
+        )
+
+        # Add only </s> token
+        label = torch.cat(
+            [
+                torch.tensor(dec_input_tokens, dtype=torch.int64),
+                self.eos_token,
+                torch.tensor([self.pad_token] * dec_num_padding_tokens, dtype=torch.int64),
+            ],
+            dim=0,
+        )
+
+        # Double check the size of the tensors to make sure they are all seq_len long
+        assert encoder_input.size(0) == self.seq_len
+        assert decoder_input.size(0) == self.seq_len
+        assert label.size(0) == self.seq_len
 
         return {
-            "encoder_input": source_tokens,
-            "decoder_input": target_input,
-            "encoder_mask": source_mask,
-            "decoder_mask": target_mask,
-            "label": target_output,
-            "source_text": source_text,
-            "target_text": target_text
+            "encoder_input": encoder_input,  # (seq_len)
+            "decoder_input": decoder_input,  # (seq_len)
+            "encoder_mask": (encoder_input != self.pad_token).unsqueeze(0).unsqueeze(0).int(), # (1, 1, seq_len)
+            "decoder_mask": (decoder_input != self.pad_token).unsqueeze(0).int() & causal_mask(decoder_input.size(0)), # (1, seq_len) & (1, seq_len, seq_len),
+            "label": label,  # (seq_len)
+            "src_text": src_text,
+            "tgt_text": tgt_text,
         }
-
-    def tokenize_and_pad(self, tokenizer, text, include_end=True):
-        tokens = torch.tensor(tokenizer.encode(text).ids, dtype=torch.int64)
-        if include_end:
-            tokens = torch.cat([tokens, self.end_token])
-        padding_length = self.max_len - len(tokens)
-        if padding_length < 0:
-            raise ValueError("Sequence exceeds maximum length")
-        return torch.cat([tokens, self.pad_token.repeat(padding_length)])
-
-    def create_padding_mask(self, sequence):
-        return (sequence != self.pad_token).unsqueeze(0).unsqueeze(0).int()
-
-    def create_causal_mask(self, sequence):
-        seq_len = sequence.size(0)
-        mask = torch.triu(torch.ones((1, seq_len, seq_len)), diagonal=1).type(torch.int)
-        return (sequence != self.pad_token).unsqueeze(0).int() & (mask == 0)
+    
+def causal_mask(size):
+    mask = torch.triu(torch.ones((1, size, size)), diagonal=1).type(torch.int)
+    return mask == 0
